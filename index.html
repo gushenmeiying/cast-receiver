@@ -4,17 +4,21 @@
 <meta charset="utf-8">
 <title>SmartMirroring Receiver</title>
 <style>
-  body { background: #000; margin: 0; display: flex; align-items: center; justify-content: center; height: 100vh; }
-  p { color: #666; font-family: sans-serif; font-size: 24px; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; width: 100vw; height: 100vh; overflow: hidden; }
+  video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+  #status { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+             color: #666; font-family: sans-serif; font-size: 24px; }
 </style>
 </head>
 <body>
+<video id="video" autoplay playsinline></video>
 <p id="status">Connecting...</p>
 <!--
-  This is the Cast Custom Receiver redirect page.
-  Deployed to GitHub Pages (HTTPS). After receiving the sender IP via
-  Cast custom namespace message, it redirects to the sender's local
-  HTTP receiver page where WebRTC signaling happens over ws://.
+  SmartMirroring Cast Custom Receiver
+  Uses Cast namespace as WebRTC signaling channel — no HTTP/WS redirect needed.
+  Deployed to GitHub Pages (HTTPS).
+  App ID: 25EA9BE4
 -->
 <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
 <script>
@@ -23,33 +27,135 @@
 
   var NAMESPACE = 'urn:x-cast:com.smartmirroring.webrtc';
   var context = cast.framework.CastReceiverContext.getInstance();
-  var timeout = null;
+  var video = document.getElementById('video');
+  var status = document.getElementById('status');
+  var pc = null;
+  var senderId = null;
 
-  // Listen for custom messages from sender
+  var config = {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' }
+    ]
+  };
+
+  function sendToSender(msg) {
+    if (!senderId) return;
+    context.sendCustomMessage(NAMESPACE, senderId, msg);
+  }
+
+  function handleOffer(data) {
+    console.log('Handling offer');
+    status.textContent = 'Setting up WebRTC...';
+
+    pc = new RTCPeerConnection(config);
+
+    pc.ontrack = function(event) {
+      console.log('Got track', event.track.kind);
+      video.srcObject = event.streams[0];
+      status.style.display = 'none';
+    };
+
+    pc.onicecandidate = function(event) {
+      if (event.candidate) {
+        sendToSender({
+          type: 'IceCandidate',
+          payload: {
+            sdp: event.candidate.candidate,
+            sdpMid: event.candidate.sdpMid,
+            sdpMLineIndex: event.candidate.sdpMLineIndex
+          }
+        });
+      }
+    };
+
+    pc.onconnectionstatechange = function() {
+      console.log('PC state:', pc.connectionState);
+      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+        status.textContent = 'Connection lost';
+        status.style.display = 'block';
+      }
+    };
+
+    var sdp = data.sdp || data;
+    var offer = { type: 'offer', sdp: (typeof sdp === 'string') ? sdp : sdp.sdp };
+
+    pc.setRemoteDescription(new RTCSessionDescription(offer))
+      .then(function() { return pc.createAnswer(); })
+      .then(function(answer) { return pc.setLocalDescription(answer); })
+      .then(function() {
+        sendToSender({
+          type: 'SessionDescription',
+          payload: { type: pc.localDescription.type, sdp: pc.localDescription.sdp }
+        });
+      })
+      .catch(function(err) {
+        console.error('WebRTC error:', err);
+        status.textContent = 'WebRTC error: ' + err.message;
+      });
+  }
+
+  function handleIceCandidate(data) {
+    if (!pc) return;
+    var candidate = new RTCIceCandidate({
+      candidate: data.sdp,
+      sdpMid: data.sdpMid,
+      sdpMLineIndex: data.sdpMLineIndex
+    });
+    pc.addIceCandidate(candidate).catch(function(e) {
+      console.warn('addIceCandidate error:', e);
+    });
+  }
+
+  // Listen for Cast messages — this IS our signaling channel
   context.addCustomMessageListener(NAMESPACE, function(event) {
-    console.log('Got message from sender:', event.data);
+    console.log('Cast message:', JSON.stringify(event.data));
+    senderId = event.senderId;
     var data = event.data;
-    if (data && data.senderIP) {
-      var port = data.httpPort || 9099;
-      var url = 'http://' + data.senderIP + ':' + port + '/chromecast.html';
-      console.log('Redirecting to: ' + url);
-      document.getElementById('status').textContent = 'Redirecting...';
-      // Small delay to ensure Cast session is stable
-      setTimeout(function() {
-        location.replace(url);
-      }, 300);
+    if (!data || !data.type) return;
+
+    switch (data.type) {
+      case 'offer':
+      case 'SessionDescription':
+        if (data.payload) {
+          handleOffer(data.payload);
+        } else {
+          handleOffer(data);
+        }
+        break;
+      case 'IceCandidate':
+        handleIceCandidate(data.payload || data);
+        break;
+      case 'senderIP':
+        // Legacy: acknowledge but no redirect needed
+        console.log('Received senderIP (ignored, using Cast signaling)');
+        sendToSender({ type: 'ready' });
+        break;
+      case 'Disconnect':
+        if (pc) { pc.close(); pc = null; }
+        status.textContent = 'Disconnected';
+        status.style.display = 'block';
+        break;
     }
   });
 
-  // Start the Cast receiver context
+  // Start Cast receiver
   var options = new cast.framework.CastReceiverOptions();
   options.disableIdleTimeout = true;
+  options.customNamespaces = {};
+  options.customNamespaces[NAMESPACE] = cast.framework.system.MessageType.JSON;
   context.start(options);
 
-  // Timeout: if no message received in 30s, show error
-  timeout = setTimeout(function() {
-    document.getElementById('status').textContent = 'No sender found. Please retry.';
-  }, 30000);
+  console.log('Cast receiver started, waiting for signaling via namespace');
+  status.textContent = 'Waiting for sender...';
+
+  // Timeout
+  setTimeout(function() {
+    if (!pc) {
+      status.textContent = 'No connection. Please retry.';
+    }
+  }, 60000);
 })();
 </script>
 </body>
